@@ -6,7 +6,7 @@ import csv
 import os
 from datetime import datetime
 
-LOG_DIR = '/home/varsha/drone_ws/logs'
+LOG_DIR = '/home/tanmayi_unix/nidar_ros_ws/logs'
 
 class CsvLoggerNode(Node):
     def __init__(self):

@@ -1,4 +1,5 @@
-import rclpy
+import rclpynano ~/nidar_ros_ws/src/ros_pipeline/drone_pipeline/drone_pipeline/mission_control_node.py
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Float64
@@ -18,14 +19,16 @@ class GeotagNode(Node):
         self.current_lon = None
         self.current_alt = None
         self.current_heading = None
+        qos = QoSProfile(depth=10)
+        qos.reliability = ReliabilityPolicy.BEST_EFFORT
 
-        mavros_prefix = f'/{self.drone_id}/mavros'
+        mavros_prefix = f'/{self.drone_id}'
         raw_topic = f'/{self.drone_id}/raw_detections'
         final_topic = f'/{self.drone_id}/detections'
 
-        self.create_subscription(NavSatFix, f'{mavros_prefix}/global_position/global', self.gps_callback, 10)
-        self.create_subscription(Float64, f'{mavros_prefix}/global_position/rel_alt', self.alt_callback, 10)
-        self.create_subscription(Float64, f'{mavros_prefix}/global_position/compass_hdg', self.heading_callback, 10)
+        self.create_subscription(NavSatFix, f'{mavros_prefix}/global_position/global', self.gps_callback, qos)
+        self.create_subscription(Float64, f'{mavros_prefix}/global_position/rel_alt', self.alt_callback, qos)
+        self.create_subscription(Float64, f'{mavros_prefix}/global_position/compass_hdg', self.heading_callback, qos)
         self.create_subscription(RawDetection, raw_topic, self.detection_callback, 10)
 
         self.publisher_ = self.create_publisher(Detection, final_topic, 10)
@@ -42,6 +45,11 @@ class GeotagNode(Node):
         self.current_heading = msg.data
 
     def detection_callback(self, msg):
+        self.get_logger().info(
+            f'RECEIVED RAW DETECTION: id={msg.detection_id}, '
+            f'pixel=({msg.pixel_x}, {msg.pixel_y}), '
+            f'class={msg.class_name}'
+        )
         if None in (self.current_lat, self.current_lon, self.current_alt, self.current_heading):
             self.get_logger().warn('No GPS/altitude/heading yet, skipping geotag for this detection')
             return
