@@ -8,10 +8,8 @@ def generate_launch_description():
 
         Node(
             package='drone_pipeline',
-            executable='nav_delivery_node',
-            name='rudra_navigation',
+            executable='fusion_node',
+            name='fusion',
             output='screen'
         ),
-
-        # Payload control node will be added at the very end.
     ])

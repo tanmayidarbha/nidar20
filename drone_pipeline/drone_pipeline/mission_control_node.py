@@ -13,7 +13,7 @@ class MissionControlNode(Node):
     def __init__(self):
         super().__init__('mission_control_node')
 
-        self.declare_parameter('drone_id', 'flamingo')
+        self.declare_parameter('drone_id', 'barbarik')
         self.drone_id = self.get_parameter('drone_id').get_parameter_value().string_value
 
         self.connected = False

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<mavlink>
+    <include>common.xml</include>
+    <version>3</version>
+
+    <messages>
+        <message id="180" name="TARGET_DETECTION_DATA">
+            <description>Survivor target detected by Barbarik.</description>
+
+            <field type="uint8_t" name="target_id">
+                Survivor target ID
+            </field>
+
+            <field type="uint8_t" name="confidence">
+                Detection confidence 0-100
+            </field>
+
+            <field type="int32_t" name="lat">
+                Latitude degrees * 1E7
+            </field>
+
+            <field type="int32_t" name="lon">
+                Longitude degrees * 1E7
+            </field>
+        </message>
+    </messages>
+</mavlink>

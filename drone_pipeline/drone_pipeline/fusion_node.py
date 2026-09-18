@@ -1,185 +1,121 @@
+import math
+
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
-from drone_msgs.msg import Detection, TargetList, Target
-import math
+
+from drone_msgs.msg import Detection, Target, TargetList
+
 
 DEDUP_DISTANCE_METERS = 10.0
 FIRST_TARGET_ID = 101
 
 
 class FusionNode(Node):
+
     def __init__(self):
         super().__init__('fusion_node')
 
-        self.scout_done = False
-        self.payload_done = False
-        self.all_detections = []
-        self.fused_published = False
+        self.next_target_id = FIRST_TARGET_ID
+        self.targets = []
 
-        self.create_subscription(
-            Bool,
-            '/flamingo/scan_complete',
-            self.scout_done_callback,
-            10
-        )
-
-        self.create_subscription(
-            Bool,
-            '/rudra/scan_complete',
-            self.payload_done_callback,
-            10
-        )
-
-        self.create_subscription(
+        self.detection_sub = self.create_subscription(
             Detection,
-            '/flamingo/detections',
+            '/barbarik/detections',
             self.detection_callback,
             10
         )
 
-        self.create_subscription(
-            Detection,
-            '/rudra/detections',
-            self.detection_callback,
-            10
-        )
-
-        self.targets_pub = self.create_publisher(
+        self.target_pub = self.create_publisher(
             TargetList,
             '/rudra/target_list',
             10
         )
 
         self.get_logger().info(
-            'Fusion node started, collecting detections from both drones'
+            'Fusion node started: Barbarik detections -> Rudra targets'
         )
-
-    def scout_done_callback(self, msg):
-        if msg.data:
-            self.scout_done = True
-            self.get_logger().info(
-                'Flamingo scan complete signal received'
-            )
-            self.try_fuse()
-
-    def payload_done_callback(self, msg):
-        if msg.data:
-            self.payload_done = True
-            self.get_logger().info(
-                'Rudra scan complete signal received'
-            )
-            self.try_fuse()
 
     def detection_callback(self, msg):
-        self.all_detections.append(msg)
 
-        self.get_logger().info(
-            f'Received detection #{msg.detection_id} '
-            f'from {msg.drone_id}'
-        )
+        # Check whether this detection is close to an existing target
+        for target in self.targets:
 
-    def try_fuse(self):
-        if self.fused_published:
-            return
-
-        if not (self.scout_done and self.payload_done):
-            return
-
-        self.get_logger().info(
-            f'Both scans complete. '
-            f'Fusing {len(self.all_detections)} detections'
-        )
-
-        targets = self.dedup_detections(self.all_detections)
-
-        target_list_msg = TargetList()
-        target_list_msg.targets = targets
-
-        self.targets_pub.publish(target_list_msg)
-
-        self.fused_published = True
-
-        self.get_logger().info(
-            f'Published {len(targets)} fused targets '
-            f'on /rudra/target_list'
-        )
-
-        for target in targets:
-            self.get_logger().info(
-                f'Target {target.target_id}: '
-                f'{target.latitude:.6f}, '
-                f'{target.longitude:.6f} '
-                f'confidence={target.confidence:.2f} '
-                f'source={target.source_drone_id}'
+            distance = self.haversine_distance(
+                msg.latitude,
+                msg.longitude,
+                target.latitude,
+                target.longitude
             )
 
-    def dedup_detections(self, detections):
-        clusters = []
+            if distance <= DEDUP_DISTANCE_METERS:
 
-        for det in detections:
-            placed = False
+                # Keep the higher-confidence detection
+                if msg.confidence > target.confidence:
+                    target.latitude = msg.latitude
+                    target.longitude = msg.longitude
+                    target.confidence = msg.confidence
+                    target.source_drone_id = msg.drone_id
 
-            for cluster in clusters:
-                representative = max(
-                    cluster,
-                    key=lambda d: d.confidence
-                )
+                    self.publish_targets()
 
-                distance = self.haversine_m(
-                    representative.latitude,
-                    representative.longitude,
-                    det.latitude,
-                    det.longitude
-                )
+                    self.get_logger().info(
+                        f'Updated target {target.target_id} '
+                        f'with higher confidence {msg.confidence:.2f}'
+                    )
 
-                if distance <= DEDUP_DISTANCE_METERS:
-                    cluster.append(det)
-                    placed = True
-                    break
+                return
 
-            if not placed:
-                clusters.append([det])
+        # New target
+        target = Target()
 
-        targets = []
+        target.target_id = self.next_target_id
+        target.latitude = msg.latitude
+        target.longitude = msg.longitude
+        target.confidence = msg.confidence
+        target.source_drone_id = msg.drone_id
 
-        for index, cluster in enumerate(clusters):
-            best = max(
-                cluster,
-                key=lambda d: d.confidence
-            )
+        self.targets.append(target)
+        self.next_target_id += 1
 
-            target = Target()
+        self.publish_targets()
 
-            # Persistent NIDAR survivor ID
-            target.target_id = FIRST_TARGET_ID + index
+        self.get_logger().info(
+            f'NEW TARGET {target.target_id}: '
+            f'lat={target.latitude:.7f}, '
+            f'lon={target.longitude:.7f}, '
+            f'confidence={target.confidence:.2f}'
+        )
 
-            target.latitude = best.latitude
-            target.longitude = best.longitude
-            target.confidence = best.confidence
-            target.source_drone_id = best.drone_id
+    def publish_targets(self):
 
-            targets.append(target)
+        msg = TargetList()
+        msg.header.stamp = self.get_clock().now().to_msg()
 
-        return targets
+        msg.targets = self.targets
 
-    def haversine_m(self, lat1, lon1, lat2, lon2):
+        self.target_pub.publish(msg)
+
+    @staticmethod
+    def haversine_distance(lat1, lon1, lat2, lon2):
+
         R = 6371000.0
 
-        phi1 = math.radians(lat1)
-        phi2 = math.radians(lat2)
+        lat1 = math.radians(lat1)
+        lat2 = math.radians(lat2)
 
-        dphi = math.radians(lat2 - lat1)
-        dlambda = math.radians(lon2 - lon1)
+        dlat = lat2 - lat1
+        dlon = math.radians(lon2 - lon1)
 
         a = (
-            math.sin(dphi / 2) ** 2
-            + math.cos(phi1)
-            * math.cos(phi2)
-            * math.sin(dlambda / 2) ** 2
+            math.sin(dlat / 2) ** 2
+            + math.cos(lat1)
+            * math.cos(lat2)
+            * math.sin(dlon / 2) ** 2
         )
 
-        return 2 * R * math.asin(math.sqrt(a))
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+        return R * c
 
 
 def main(args=None):
@@ -187,10 +123,13 @@ def main(args=None):
 
     node = FusionNode()
 
-    rclpy.spin(node)
-
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -14,7 +14,7 @@ import cv2
 # PATHS
 # ============================================================
 
-MODEL_PATH = '/home/tanmayi_unix/nidar_ros_ws/models/best.pt'
+MODEL_PATH = '/home/tanmayi_unix/nidar20_ws/models/best.pt'
 
 CONFIDENCE_THRESHOLD = 0.5
 
@@ -28,7 +28,7 @@ class DetectionNode(Node):
         # Drone ID
         # ----------------------------------------------------
 
-        self.declare_parameter('drone_id', 'flamingo')
+        self.declare_parameter('drone_id', 'barbarik')
 
         self.drone_id = (
             self.get_parameter('drone_id')
