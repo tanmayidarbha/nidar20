@@ -10,7 +10,7 @@ class CameraNode(Node):
     def __init__(self):
         super().__init__('camera_node')
 
-        self.declare_parameter('drone_id', 'barbarik')
+        self.declare_parameter('drone_id', 'rudra')
         self.declare_parameter('rtsp_url', DEFAULT_RTSP_URL)
         self.drone_id = self.get_parameter('drone_id').get_parameter_value().string_value
         rtsp_url = self.get_parameter('rtsp_url').get_parameter_value().string_value

@@ -1,30 +1,24 @@
 import math
+
 import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import NavSatFix
-from std_msgs.msg import UInt8
-from mavros_msgs.msg import GlobalPositionTarget
-from mavros_msgs.msg import State
+from std_msgs.msg import UInt8, Bool
+
+from mavros_msgs.msg import GlobalPositionTarget, State
 from mavros_msgs.srv import SetMode, CommandBool
 
 from drone_msgs.msg import TargetList
 
 
-# Rudra flight altitude = 20 ft
-RUDRA_ALTITUDE = 6.096
-
-# Consider target reached within 3 metres
+BARBARIK_ALTITUDE = 6.096       # 20 ft in meters
 ARRIVAL_THRESHOLD_METERS = 3.0
+MAX_PAYLOADS = 4
 
-# Position only
-TYPE_MASK_POSITION_ONLY = 4088
-
-
-STATE_WAITING = 'WAITING'
-STATE_NAVIGATING = 'NAVIGATING'
-STATE_DROPPING = 'DROPPING'
-STATE_HOVERING = 'HOVERING'
+# Position only:
+# Ignore velocity, acceleration/force, yaw and yaw-rate.
+POSITION_ONLY_TYPE_MASK = 3576
 
 
 class NavDeliveryNode(Node):
@@ -32,66 +26,86 @@ class NavDeliveryNode(Node):
     def __init__(self):
         super().__init__('nav_delivery_node')
 
-        self.declare_parameter('drone_id', 'rudra')
+        # ---------------------------------------------------------
+        # Parameters
+        # ---------------------------------------------------------
+        self.declare_parameter('drone_id', 'barbarik')
+
         self.drone_id = (
             self.get_parameter('drone_id')
             .get_parameter_value()
             .string_value
         )
 
-        mavros_prefix = f'/{self.drone_id}/mavros'
+        self.mavros_prefix = f'/{self.drone_id}/mavros'
 
-        # --------------------------------------------------
-        # STATE
-        # --------------------------------------------------
-
-        self.state = STATE_WAITING
-
-        self.current_target = None
-        self.remaining_targets = []
+        # ---------------------------------------------------------
+        # State
+        # ---------------------------------------------------------
+        self.vehicle_state = State()
 
         self.current_lat = None
         self.current_lon = None
         self.current_alt = None
 
-        self.vehicle_state = None
+        self.target_queue = []
 
-        self.arm_requested = False
-        self.guided_requested = False
-        self.takeoff_started = False
+        # Payload bay index:
+        # 0 -> first payload
+        # 1 -> second payload
+        # 2 -> third payload
+        # 3 -> fourth payload
+        self.next_bay_index = 0
 
-        # --------------------------------------------------
-        # SUBSCRIBERS
-        # --------------------------------------------------
+        self.current_target = None
 
-        self.create_subscription(
+        self.scan_complete = False
+
+        # Barbarik should only RTL after it has actually started flying.
+        self.mission_started = False
+        self.rtl_requested = False
+
+        self.state = 'WAITING'
+
+        # ---------------------------------------------------------
+        # Subscribers
+        # ---------------------------------------------------------
+
+        self.target_sub = self.create_subscription(
             TargetList,
             f'/{self.drone_id}/target_list',
-            self.target_list_callback,
+            self.target_callback,
             10
         )
 
-        self.create_subscription(
+        self.gps_sub = self.create_subscription(
             NavSatFix,
-            f'{mavros_prefix}/global_position/global',
+            f'{self.mavros_prefix}/global_position/global',
             self.gps_callback,
             10
         )
 
-        self.create_subscription(
+        self.state_sub = self.create_subscription(
             State,
-            f'{mavros_prefix}/state',
+            f'{self.mavros_prefix}/state',
             self.state_callback,
             10
         )
 
-        # --------------------------------------------------
-        # PUBLISHERS
-        # --------------------------------------------------
+        self.scan_complete_sub = self.create_subscription(
+            Bool,
+            f'/{self.drone_id}/scan_complete',
+            self.scan_complete_callback,
+            10
+        )
+
+        # ---------------------------------------------------------
+        # Publishers
+        # ---------------------------------------------------------
 
         self.setpoint_pub = self.create_publisher(
             GlobalPositionTarget,
-            f'{mavros_prefix}/setpoint_position/global',
+            f'{self.mavros_prefix}/setpoint_position/global',
             10
         )
 
@@ -101,23 +115,23 @@ class NavDeliveryNode(Node):
             10
         )
 
-        # --------------------------------------------------
-        # SERVICES
-        # --------------------------------------------------
+        # ---------------------------------------------------------
+        # Services
+        # ---------------------------------------------------------
 
-        self.mode_client = self.create_client(
-            SetMode,
-            f'{mavros_prefix}/set_mode'
-        )
-
-        self.arm_client = self.create_client(
+        self.arming_client = self.create_client(
             CommandBool,
-            f'{mavros_prefix}/cmd/arming'
+            f'{self.mavros_prefix}/cmd/arming'
         )
 
-        # --------------------------------------------------
-        # CONTROL LOOP
-        # --------------------------------------------------
+        self.set_mode_client = self.create_client(
+            SetMode,
+            f'{self.mavros_prefix}/set_mode'
+        )
+
+        # ---------------------------------------------------------
+        # Main loop
+        # ---------------------------------------------------------
 
         self.timer = self.create_timer(
             0.5,
@@ -125,414 +139,520 @@ class NavDeliveryNode(Node):
         )
 
         self.get_logger().info(
-            'Rudra navigation started - waiting for target'
+            f'Barbarik navigation node started for "{self.drone_id}"'
         )
 
-    # ======================================================
+    # =============================================================
     # CALLBACKS
-    # ======================================================
-
-    def gps_callback(self, msg):
-        self.current_lat = msg.latitude
-        self.current_lon = msg.longitude
-        self.current_alt = msg.altitude
+    # =============================================================
 
     def state_callback(self, msg):
         self.vehicle_state = msg
 
-    def target_list_callback(self, msg):
+    def gps_callback(self, msg):
+        self.current_lat = msg.latitude
+        self.current_lon = msg.longitude
 
-        if not msg.targets:
-            return
+        if not math.isnan(msg.altitude):
+            self.current_alt = msg.altitude
 
-        existing_ids = set()
+    def scan_complete_callback(self, msg):
+        if msg.data and not self.scan_complete:
+            self.scan_complete = True
 
-        if self.current_target is not None:
-            existing_ids.add(self.current_target.target_id)
+            self.get_logger().info(
+                'Rudra scan complete received.'
+            )
 
-        for target in self.remaining_targets:
-            existing_ids.add(target.target_id)
+    def target_callback(self, msg):
+        """
+        Receive targets from Rudra.
 
-        new_targets = []
+        Target IDs are used to prevent duplicate processing.
+        """
 
         for target in msg.targets:
 
-            if target.target_id not in existing_ids:
-                self.remaining_targets.append(target)
-                existing_ids.add(target.target_id)
-                new_targets.append(target)
+            # Ignore a target that was already processed.
+            already_known = False
 
-        if new_targets:
-            self.get_logger().info(
-                f'Received {len(new_targets)} new target(s)'
-            )
+            if self.current_target is not None:
+                if target.target_id == self.current_target.target_id:
+                    already_known = True
 
-            for target in new_targets:
-                self.get_logger().info(
-                    f'Queued target {target.target_id}: '
-                    f'lat={target.latitude:.7f}, '
-                    f'lon={target.longitude:.7f}'
+            for queued_target in self.target_queue:
+                if target.target_id == queued_target.target_id:
+                    already_known = True
+                    break
+
+            if already_known:
+                continue
+
+            # Maximum four payloads.
+            if self.next_bay_index + len(self.target_queue) >= MAX_PAYLOADS:
+                self.get_logger().warn(
+                    'Maximum payload capacity reached. '
+                    'Ignoring additional target.'
                 )
+                continue
 
-        # If Rudra is waiting on the ground, begin flight
-        if self.state == STATE_WAITING and self.remaining_targets:
+            self.target_queue.append(target)
+
             self.get_logger().info(
-                'Target received - starting Rudra flight'
+                f'New target received: '
+                f'ID={target.target_id}, '
+                f'Lat={target.latitude:.7f}, '
+                f'Lon={target.longitude:.7f}'
             )
 
-    # ======================================================
+    # =============================================================
     # MAIN CONTROL LOOP
-    # ======================================================
+    # =============================================================
 
     def control_loop(self):
 
-        # Need GPS before doing anything
-        if self.current_lat is None or self.current_lon is None:
+        if self.rtl_requested:
             return
 
-        # ----------------------------------------------
+        # ---------------------------------------------------------
         # WAITING
-        # ----------------------------------------------
+        # ---------------------------------------------------------
 
-        if self.state == STATE_WAITING:
+        if self.state == 'WAITING':
 
-            if not self.remaining_targets:
-                return
+            if len(self.target_queue) > 0:
 
-            # Start flight only after target received
-            self.start_flight()
+                self.start_flight()
 
+            # If there are no targets and Rudra finishes scanning,
+            # Barbarik simply stays on the ground.
             return
 
-        # ----------------------------------------------
+        # ---------------------------------------------------------
         # NAVIGATING
-        # ----------------------------------------------
+        # ---------------------------------------------------------
 
-        if self.state == STATE_NAVIGATING:
+        elif self.state == 'NAVIGATING':
 
             if self.current_target is None:
+                self.state = 'WAITING'
+                return
 
-                if self.remaining_targets:
-                    self.pick_next_target()
-                else:
-                    self.state = STATE_HOVERING
-                    return
+            if self.current_lat is None or self.current_lon is None:
+                return
 
-            # Keep publishing target setpoint
-            self.publish_target_setpoint(
-                self.current_target
-            )
-
-            distance = self.haversine_m(
+            distance = self.calculate_distance(
                 self.current_lat,
                 self.current_lon,
                 self.current_target.latitude,
                 self.current_target.longitude
             )
 
+            self.publish_target_setpoint(
+                self.current_target.latitude,
+                self.current_target.longitude,
+                BARBARIK_ALTITUDE
+            )
+
+            self.get_logger().debug(
+                f'Distance to target: {distance:.2f} m'
+            )
+
             if distance <= ARRIVAL_THRESHOLD_METERS:
 
                 self.get_logger().info(
-                    f'Arrived at target '
-                    f'{self.current_target.target_id} '
-                    f'({distance:.1f} m)'
+                    f'Arrived at target {self.current_target.target_id}'
                 )
 
-                self.state = STATE_DROPPING
+                self.state = 'DROPPING'
 
-            return
-
-        # ----------------------------------------------
+        # ---------------------------------------------------------
         # DROPPING
-        # ----------------------------------------------
+        # ---------------------------------------------------------
 
-        if self.state == STATE_DROPPING:
+        elif self.state == 'DROPPING':
 
             self.drop_payload()
 
-            return
-
-        # ----------------------------------------------
+        # ---------------------------------------------------------
         # HOVERING
-        # ----------------------------------------------
+        # ---------------------------------------------------------
 
-        if self.state == STATE_HOVERING:
+        elif self.state == 'HOVERING':
 
-            # If a new target arrives, immediately continue
-            if self.remaining_targets:
+            if self.current_target is not None:
 
-                self.get_logger().info(
-                    'New target received while hovering'
+                self.publish_target_setpoint(
+                    self.current_target.latitude,
+                    self.current_target.longitude,
+                    BARBARIK_ALTITUDE
                 )
 
-                self.state = STATE_NAVIGATING
+            # More targets arrived while Barbarik was flying.
+            if len(self.target_queue) > 0:
+
                 self.pick_next_target()
 
-                return
+            # Scan finished and all targets have been delivered.
+            elif self.scan_complete and self.mission_started:
 
-            # Otherwise remain at 20 ft
-            self.publish_hover_setpoint()
+                self.return_to_launch()
 
-    # ======================================================
-    # START FLIGHT
-    # ======================================================
+    # =============================================================
+    # FLIGHT START
+    # =============================================================
 
     def start_flight(self):
 
-        if self.vehicle_state is None:
-            return
-
-        if not self.vehicle_state.connected:
+        if self.next_bay_index >= MAX_PAYLOADS:
             self.get_logger().warn(
-                'Waiting for Rudra FCU connection'
+                'All four payload bays have already been used.'
             )
             return
-
-        # ARM
-        if not self.vehicle_state.armed:
-
-            self.arm_drone()
-            return
-
-        # GUIDED
-        if self.vehicle_state.mode != 'GUIDED':
-
-            self.set_guided_mode()
-            return
-
-        # Already armed + GUIDED
-        self.get_logger().info(
-            'Rudra armed and in GUIDED mode - '
-            'starting delivery'
-        )
-
-        self.state = STATE_NAVIGATING
 
         self.pick_next_target()
 
-    # ======================================================
-    # ARM
-    # ======================================================
-
-    def arm_drone(self):
-
-        if self.arm_requested:
+        if self.current_target is None:
             return
 
-        if not self.arm_client.wait_for_service(
-            timeout_sec=0.2
-        ):
-            return
-
-        request = CommandBool.Request()
-        request.value = True
-
-        self.arm_requested = True
-
-        future = self.arm_client.call_async(request)
-        future.add_done_callback(
-            self.arm_response
-        )
+        self.mission_started = True
 
         self.get_logger().info(
-            'ARM command sent to Rudra'
+            'Starting Barbarik delivery mission.'
         )
 
-    def arm_response(self, future):
+        # ---------------------------------------------------------
+        # ARM
+        # ---------------------------------------------------------
 
-        self.arm_requested = False
+        if not self.vehicle_state.armed:
 
-        try:
-            result = future.result()
-
-            if result and result.success:
-                self.get_logger().info(
-                    'Rudra ARM successful'
-                )
-            else:
+            if not self.arming_client.wait_for_service(
+                timeout_sec=1.0
+            ):
                 self.get_logger().warn(
-                    'Rudra ARM failed - retrying'
+                    'Arming service not available.'
                 )
+                return
 
-        except Exception as e:
-            self.get_logger().warn(
-                f'ARM service error: {e}'
+            request = CommandBool.Request()
+            request.value = True
+
+            future = self.arming_client.call_async(request)
+
+            future.add_done_callback(
+                self.arm_response_callback
             )
 
-    # ======================================================
-    # GUIDED MODE
-    # ======================================================
-
-    def set_guided_mode(self):
-
-        if self.guided_requested:
             return
 
-        if not self.mode_client.wait_for_service(
-            timeout_sec=0.2
-        ):
-            return
+        # ---------------------------------------------------------
+        # GUIDED
+        # ---------------------------------------------------------
 
-        request = SetMode.Request()
-        request.custom_mode = 'GUIDED'
+        if self.vehicle_state.mode != 'GUIDED':
 
-        self.guided_requested = True
-
-        future = self.mode_client.call_async(request)
-        future.add_done_callback(
-            self.guided_response
-        )
-
-        self.get_logger().info(
-            'GUIDED mode command sent to Rudra'
-        )
-
-    def guided_response(self, future):
-
-        self.guided_requested = False
-
-        try:
-            result = future.result()
-
-            if result and result.mode_sent:
-                self.get_logger().info(
-                    'GUIDED mode accepted'
-                )
-            else:
+            if not self.set_mode_client.wait_for_service(
+                timeout_sec=1.0
+            ):
                 self.get_logger().warn(
-                    'GUIDED mode failed - retrying'
+                    'Set mode service not available.'
                 )
+                return
 
-        except Exception as e:
-            self.get_logger().warn(
-                f'GUIDED service error: {e}'
+            request = SetMode.Request()
+            request.custom_mode = 'GUIDED'
+
+            future = self.set_mode_client.call_async(request)
+
+            future.add_done_callback(
+                self.guided_response_callback
             )
 
-    # ======================================================
-    # TARGET SELECTION
-    # ======================================================
-
-    def pick_next_target(self):
-
-        if not self.remaining_targets:
-            self.current_target = None
-            self.state = STATE_HOVERING
             return
 
-        # Choose nearest queued survivor
-        self.current_target = min(
-            self.remaining_targets,
-            key=lambda target:
-                self.haversine_m(
-                    self.current_lat,
-                    self.current_lon,
-                    target.latitude,
-                    target.longitude
-                )
-        )
+        # ---------------------------------------------------------
+        # Already armed + GUIDED
+        # ---------------------------------------------------------
 
-        self.remaining_targets.remove(
-            self.current_target
-        )
+        self.state = 'NAVIGATING'
 
         self.get_logger().info(
             f'Navigating to target '
             f'{self.current_target.target_id}'
         )
 
-    # ======================================================
-    # SETPOINT TO TARGET
-    # ======================================================
+    # =============================================================
+    # ARM RESPONSE
+    # =============================================================
 
-    def publish_target_setpoint(self, target):
+    def arm_response_callback(self, future):
 
-        msg = GlobalPositionTarget()
+        try:
+            response = future.result()
 
-        msg.coordinate_frame = (
-            GlobalPositionTarget.FRAME_GLOBAL_REL_ALT
+            if response.success:
+
+                self.get_logger().info(
+                    'Barbarik armed.'
+                )
+
+                # GUIDED will be requested on the next loop.
+                return
+
+            self.get_logger().error(
+                'Barbarik arming failed.'
+            )
+
+        except Exception as e:
+
+            self.get_logger().error(
+                f'Arming service error: {e}'
+            )
+
+    # =============================================================
+    # GUIDED RESPONSE
+    # =============================================================
+
+    def guided_response_callback(self, future):
+
+        try:
+            response = future.result()
+
+            if response.mode_sent:
+
+                self.get_logger().info(
+                    'GUIDED mode command sent.'
+                )
+
+            else:
+
+                self.get_logger().error(
+                    'Failed to send GUIDED mode command.'
+                )
+
+        except Exception as e:
+
+            self.get_logger().error(
+                f'GUIDED mode service error: {e}'
+            )
+
+    # =============================================================
+    # PICK NEXT TARGET
+    # =============================================================
+
+    def pick_next_target(self):
+
+        if len(self.target_queue) == 0:
+
+            self.current_target = None
+
+            if self.scan_complete and self.mission_started:
+                self.return_to_launch()
+            else:
+                self.state = 'HOVERING'
+
+            return
+
+        if self.next_bay_index >= MAX_PAYLOADS:
+
+            self.get_logger().warn(
+                'No payload bays remaining.'
+            )
+
+            self.target_queue.clear()
+            self.current_target = None
+
+            if self.scan_complete and self.mission_started:
+                self.return_to_launch()
+            else:
+                self.state = 'HOVERING'
+
+            return
+
+        self.current_target = self.target_queue.pop(0)
+
+        self.get_logger().info(
+            f'Selected target '
+            f'{self.current_target.target_id} '
+            f'for payload bay {self.next_bay_index}'
         )
 
-        msg.type_mask = TYPE_MASK_POSITION_ONLY
+        self.state = 'NAVIGATING'
 
-        msg.latitude = target.latitude
-        msg.longitude = target.longitude
-
-        # Rudra always flies at 20 ft
-        msg.altitude = RUDRA_ALTITUDE
-
-        self.setpoint_pub.publish(msg)
-
-    # ======================================================
-    # HOVER
-    # ======================================================
-
-    def publish_hover_setpoint(self):
-
-        msg = GlobalPositionTarget()
-
-        msg.coordinate_frame = (
-            GlobalPositionTarget.FRAME_GLOBAL_REL_ALT
-        )
-
-        msg.type_mask = TYPE_MASK_POSITION_ONLY
-
-        # Hold current position
-        msg.latitude = self.current_lat
-        msg.longitude = self.current_lon
-
-        # Hold 20 ft altitude
-        msg.altitude = RUDRA_ALTITUDE
-
-        self.setpoint_pub.publish(msg)
-
-    # ======================================================
-    # PAYLOAD DROP
-    # ======================================================
+    # =============================================================
+    # DROP PAYLOAD
+    # =============================================================
 
     def drop_payload(self):
 
         if self.current_target is None:
+            self.state = 'WAITING'
             return
 
-        target_id = self.current_target.target_id
+        if self.next_bay_index >= MAX_PAYLOADS:
 
-        self.get_logger().info(
-            f'Dropping payload for target {target_id}'
-        )
-
-        # Send target ID to payload controller
-        self.drop_pub.publish(
-            UInt8(data=target_id)
-        )
-
-        # Delivery completed
-        self.current_target = None
-
-        # Immediately continue to next target
-        if self.remaining_targets:
-
-            self.get_logger().info(
-                'Next target already queued - continuing'
+            self.get_logger().error(
+                'Payload limit reached. No more drops allowed.'
             )
 
-            self.state = STATE_NAVIGATING
+            self.current_target = None
+
+            if self.scan_complete:
+                self.return_to_launch()
+            else:
+                self.state = 'HOVERING'
+
+            return
+
+        bay_index = self.next_bay_index
+
+        self.get_logger().info(
+            f'Dropping payload for target '
+            f'{self.current_target.target_id} '
+            f'using bay {bay_index}'
+        )
+
+        msg = UInt8()
+        msg.data = bay_index
+
+        self.drop_pub.publish(msg)
+
+        # Move to next payload bay.
+        self.next_bay_index += 1
+
+        # Current target completed.
+        self.current_target = None
+
+        # ---------------------------------------------------------
+        # More targets already queued
+        # ---------------------------------------------------------
+
+        if len(self.target_queue) > 0:
+
             self.pick_next_target()
+
+        # ---------------------------------------------------------
+        # No targets left
+        # ---------------------------------------------------------
 
         else:
 
-            self.get_logger().info(
-                'No targets remaining - '
-                'Rudra hovering at 20 ft'
+            if self.scan_complete:
+
+                self.get_logger().info(
+                    'All detected targets delivered and '
+                    'Rudra scan is complete. RTL.'
+                )
+
+                self.return_to_launch()
+
+            else:
+
+                self.get_logger().info(
+                    'Waiting for additional targets from Rudra.'
+                )
+
+                self.state = 'HOVERING'
+
+    # =============================================================
+    # RETURN TO LAUNCH
+    # =============================================================
+
+    def return_to_launch(self):
+
+        if self.rtl_requested:
+            return
+
+        if not self.mission_started:
+            return
+
+        self.rtl_requested = True
+
+        self.get_logger().info(
+            'Commanding Barbarik to RTL.'
+        )
+
+        if not self.set_mode_client.wait_for_service(
+            timeout_sec=1.0
+        ):
+            self.get_logger().error(
+                'Set mode service unavailable. '
+                'Cannot command RTL.'
+            )
+            self.rtl_requested = False
+            return
+
+        request = SetMode.Request()
+        request.custom_mode = 'RTL'
+
+        future = self.set_mode_client.call_async(request)
+
+        future.add_done_callback(
+            self.rtl_response_callback
+        )
+
+    def rtl_response_callback(self, future):
+
+        try:
+
+            response = future.result()
+
+            if response.mode_sent:
+
+                self.get_logger().info(
+                    'RTL command sent to Barbarik.'
+                )
+
+            else:
+
+                self.get_logger().error(
+                    'Failed to send RTL command.'
+                )
+
+                self.rtl_requested = False
+
+        except Exception as e:
+
+            self.get_logger().error(
+                f'RTL service error: {e}'
             )
 
-            self.state = STATE_HOVERING
+            self.rtl_requested = False
 
-    # ======================================================
-    # HAVERSINE DISTANCE
-    # ======================================================
+    # =============================================================
+    # SETPOINT
+    # =============================================================
+
+    def publish_target_setpoint(
+        self,
+        latitude,
+        longitude,
+        altitude
+    ):
+
+        msg = GlobalPositionTarget()
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        msg.coordinate_frame = (
+            GlobalPositionTarget.FRAME_GLOBAL_REL_ALT
+        )
+
+        msg.type_mask = POSITION_ONLY_TYPE_MASK
+
+        msg.latitude = latitude
+        msg.longitude = longitude
+        msg.altitude = altitude
+
+        self.setpoint_pub.publish(msg)
+
+    # =============================================================
+    # DISTANCE CALCULATION
+    # =============================================================
 
     @staticmethod
-    def haversine_m(
+    def calculate_distance(
         lat1,
         lon1,
         lat2,
@@ -541,30 +661,26 @@ class NavDeliveryNode(Node):
 
         R = 6371000.0
 
-        phi1 = math.radians(lat1)
-        phi2 = math.radians(lat2)
+        lat1_rad = math.radians(lat1)
+        lat2_rad = math.radians(lat2)
 
-        dphi = math.radians(
-            lat2 - lat1
-        )
-
-        dlambda = math.radians(
-            lon2 - lon1
-        )
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
 
         a = (
-            math.sin(dphi / 2) ** 2
+            math.sin(dlat / 2) ** 2
             +
-            math.cos(phi1)
-            * math.cos(phi2)
-            * math.sin(dlambda / 2) ** 2
+            math.cos(lat1_rad)
+            * math.cos(lat2_rad)
+            * math.sin(dlon / 2) ** 2
         )
 
-        return (
-            2
-            * R
-            * math.asin(math.sqrt(a))
+        c = 2 * math.atan2(
+            math.sqrt(a),
+            math.sqrt(1 - a)
         )
+
+        return R * c
 
 
 def main(args=None):
@@ -573,11 +689,15 @@ def main(args=None):
 
     node = NavDeliveryNode()
 
-    rclpy.spin(node)
+    try:
+        rclpy.spin(node)
 
-    node.destroy_node()
+    except KeyboardInterrupt:
+        pass
 
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

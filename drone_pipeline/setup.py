@@ -54,6 +54,8 @@ setup(
             # Rudra
             'nav_delivery_node = drone_pipeline.nav_delivery_node:main',
             'payload_control_node = drone_pipeline.payload_control_node:main',
+            'rfd_receiver_node = drone_pipeline.rfd_receiver_node:main',
+            'rfd_sender_node = drone_pipeline.rfd_sender_node:main',
         ],
     },
 )

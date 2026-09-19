@@ -24,6 +24,7 @@ class CSVLoggerNode(Node):
 
         self.logged_target_ids = set()
 
+        # Rudra is the scout, so log Rudra's fused targets.
         self.target_sub = self.create_subscription(
             TargetList,
             '/rudra/target_list',
@@ -54,7 +55,7 @@ class CSVLoggerNode(Node):
                     'latitude',
                     'longitude',
                     'confidence',
-                    'source_drone'
+                    'source_drone_id'
                 ])
 
     def target_callback(self, msg):
@@ -74,9 +75,9 @@ class CSVLoggerNode(Node):
 
                 writer.writerow([
                     target.target_id,
-                    f'{target.latitude:.7f}',
-                    f'{target.longitude:.7f}',
-                    f'{target.confidence:.3f}',
+                    target.latitude,
+                    target.longitude,
+                    target.confidence,
                     target.source_drone_id
                 ])
 
@@ -86,7 +87,7 @@ class CSVLoggerNode(Node):
 
             self.get_logger().info(
                 f'Logged target {target.target_id} '
-                f'to targets.csv'
+                f'to CSV'
             )
 
 
@@ -96,11 +97,13 @@ def main(args=None):
 
     node = CSVLoggerNode()
 
-    rclpy.spin(node)
-
-    node.destroy_node()
-
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

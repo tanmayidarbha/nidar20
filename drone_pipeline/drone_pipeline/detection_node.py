@@ -1,22 +1,22 @@
+import os
+
+import cv2
 import rclpy
 from rclpy.node import Node
+
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
+
 from cv_bridge import CvBridge
 from ultralytics import YOLO
+
 from drone_msgs.msg import RawDetection
 
-import os
-import cv2
-
-
-# ============================================================
-# PATHS
-# ============================================================
 
 MODEL_PATH = '/home/tanmayi_unix/nidar20_ws/models/best.pt'
-
 CONFIDENCE_THRESHOLD = 0.5
+
+DETECTION_SAVE_DIR = '/home/tanmayi_unix/nidar20_ws/detections'
 
 
 class DetectionNode(Node):
@@ -24,11 +24,11 @@ class DetectionNode(Node):
     def __init__(self):
         super().__init__('detection_node')
 
-        # ----------------------------------------------------
-        # Drone ID
-        # ----------------------------------------------------
-
-        self.declare_parameter('drone_id', 'barbarik')
+        # Rudra is the scout.
+        self.declare_parameter(
+            'drone_id',
+            'rudra'
+        )
 
         self.drone_id = (
             self.get_parameter('drone_id')
@@ -36,188 +36,268 @@ class DetectionNode(Node):
             .string_value
         )
 
-        # ----------------------------------------------------
-        # Detection state
-        # ----------------------------------------------------
+        self.bridge = CvBridge()
 
         self.scan_started = False
         self.detection_counter = 0
 
-        # ----------------------------------------------------
-        # Save directory
-        # ----------------------------------------------------
+        # ---------------------------------------------------------
+        # Paths
+        # ---------------------------------------------------------
 
-        self.save_dir = (
-            f'/home/tanmayi_unix/nidar_ros_ws/detections/'
-            f'{self.drone_id}'
+        self.save_dir = os.path.join(
+            DETECTION_SAVE_DIR,
+            self.drone_id
         )
 
-        os.makedirs(self.save_dir, exist_ok=True)
-
-        # ----------------------------------------------------
-        # YOLO
-        # ----------------------------------------------------
-
-        self.bridge = CvBridge()
-
-        self.get_logger().info(
-            f'Loading YOLO model from {MODEL_PATH}'
+        os.makedirs(
+            self.save_dir,
+            exist_ok=True
         )
 
-        self.model = YOLO(MODEL_PATH)
-
-        # ----------------------------------------------------
+        # ---------------------------------------------------------
         # Topics
-        # ----------------------------------------------------
+        # ---------------------------------------------------------
 
-        image_topic = f'/{self.drone_id}/image_raw'
-        scan_start_topic = f'/{self.drone_id}/scan_start'
-        detections_topic = f'/{self.drone_id}/raw_detections'
+        image_topic = (
+            f'/{self.drone_id}/image_raw'
+        )
 
-        # Camera input
-        self.subscription = self.create_subscription(
+        scan_start_topic = (
+            f'/{self.drone_id}/scan_start'
+        )
+
+        detection_topic = (
+            f'/{self.drone_id}/raw_detections'
+        )
+
+        self.image_sub = self.create_subscription(
             Image,
             image_topic,
             self.image_callback,
             10
         )
 
-        # Scan-start signal
-        self.scan_start_subscription = self.create_subscription(
+        self.scan_start_sub = self.create_subscription(
             Bool,
             scan_start_topic,
             self.scan_start_callback,
             10
         )
 
-        # Detection output
-        self.publisher_ = self.create_publisher(
+        self.detection_pub = self.create_publisher(
             RawDetection,
-            detections_topic,
+            detection_topic,
             10
+        )
+
+        # ---------------------------------------------------------
+        # YOLO
+        # ---------------------------------------------------------
+
+        self.get_logger().info(
+            f'Loading YOLO model from {MODEL_PATH}'
+        )
+
+        self.model = YOLO(
+            MODEL_PATH
         )
 
         self.get_logger().info(
             f'Detection node started for "{self.drone_id}"'
         )
 
-        self.get_logger().info(
-            f'Waiting for {scan_start_topic} before detecting...'
-        )
-
-    # ========================================================
+    # =============================================================
     # SCAN START
-    # ========================================================
+    # =============================================================
 
     def scan_start_callback(self, msg):
 
-        if msg.data and not self.scan_started:
+        if msg.data:
 
-            self.scan_started = True
+            if not self.scan_started:
 
-            self.get_logger().info(
-                f'[{self.drone_id}] SCAN STARTED — YOLO detection ON'
-            )
+                self.scan_started = True
 
-    # ========================================================
-    # IMAGE CALLBACK
-    # ========================================================
+                self.get_logger().info(
+                    'Scan started. Detection is now active.'
+                )
+
+    # =============================================================
+    # IMAGE
+    # =============================================================
 
     def image_callback(self, msg):
 
-        # Do absolutely nothing before scan starts
+        # Do not run YOLO before Rudra reaches the
+        # scan-start waypoint.
         if not self.scan_started:
             return
 
-        frame = self.bridge.imgmsg_to_cv2(
-            msg,
-            desired_encoding='bgr8'
-        )
+        try:
 
-        height, width = frame.shape[:2]
+            frame = self.bridge.imgmsg_to_cv2(
+                msg,
+                desired_encoding='bgr8'
+            )
 
-        # ----------------------------------------------------
+        except Exception as e:
+
+            self.get_logger().error(
+                f'Failed to convert image: {e}'
+            )
+
+            return
+
+        # ---------------------------------------------------------
         # YOLO inference
-        # ----------------------------------------------------
+        # ---------------------------------------------------------
 
-        results = self.model(
-            frame,
-            verbose=False
-        )[0]
+        try:
 
-        # ----------------------------------------------------
-        # Process detections
-        # ----------------------------------------------------
+            results = self.model(
+                frame,
+                conf=CONFIDENCE_THRESHOLD,
+                verbose=False
+            )
 
-        for box in results.boxes:
+        except Exception as e:
 
-            confidence = float(box.conf[0])
+            self.get_logger().error(
+                f'YOLO inference failed: {e}'
+            )
 
-            if confidence < CONFIDENCE_THRESHOLD:
-                continue
+            return
 
-            class_id = int(box.cls[0])
-            class_name = self.model.names[class_id]
+        if not results:
+            return
 
-            # ------------------------------------------------
-            # ONLY PERSONS
-            # ------------------------------------------------
+        result = results[0]
 
+        if result.boxes is None:
+            return
+
+        image_height, image_width = frame.shape[:2]
+
+        for box in result.boxes:
+
+            confidence = float(
+                box.conf[0]
+            )
+
+            class_id = int(
+                box.cls[0]
+            )
+
+            class_name = self.model.names[
+                class_id
+            ]
+
+            # We only care about people.
             if class_name.lower() != 'person':
                 continue
 
-            # ------------------------------------------------
-            # Bounding box center
-            # ------------------------------------------------
+            x1, y1, x2, y2 = (
+                box.xyxy[0].tolist()
+            )
 
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            pixel_x = (
+                x1 + x2
+            ) / 2.0
 
-            center_x = (x1 + x2) / 2.0
-            center_y = (y1 + y2) / 2.0
+            pixel_y = (
+                y1 + y2
+            ) / 2.0
 
-            # ------------------------------------------------
-            # Detection ID
-            # ------------------------------------------------
+            self.detection_counter += 1
 
-            det_id = self.detection_counter
+            detection_id = (
+                self.detection_counter
+            )
+
+            # -----------------------------------------------------
+            # Save detection image
+            # -----------------------------------------------------
+
+            annotated = frame.copy()
+
+            cv2.rectangle(
+                annotated,
+                (int(x1), int(y1)),
+                (int(x2), int(y2)),
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                annotated,
+                f'person {confidence:.2f}',
+                (int(x1), max(20, int(y1) - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2
+            )
+
+            image_filename = (
+                f'detection_{detection_id}.jpg'
+            )
 
             image_path = os.path.join(
                 self.save_dir,
-                f'detection_{det_id}.jpg'
+                image_filename
             )
 
             cv2.imwrite(
                 image_path,
-                frame
+                annotated
             )
 
-            # ------------------------------------------------
-            # Create ROS detection message
-            # ------------------------------------------------
+            # -----------------------------------------------------
+            # Publish RawDetection
+            # -----------------------------------------------------
 
-            det_msg = RawDetection()
+            detection = RawDetection()
 
-            det_msg.header = msg.header
+            detection.header = msg.header
 
-            det_msg.detection_id = det_id
-            det_msg.pixel_x = center_x
-            det_msg.pixel_y = center_y
-            det_msg.confidence = confidence
-            det_msg.class_name = class_name
+            detection.detection_id = (
+                detection_id
+            )
 
-            det_msg.image_width = width
-            det_msg.image_height = height
+            detection.pixel_x = (
+                float(pixel_x)
+            )
 
-            self.publisher_.publish(det_msg)
+            detection.pixel_y = (
+                float(pixel_y)
+            )
+
+            detection.confidence = (
+                confidence
+            )
+
+            detection.class_name = (
+                class_name
+            )
+
+            detection.image_width = (
+                image_width
+            )
+
+            detection.image_height = (
+                image_height
+            )
+
+            self.detection_pub.publish(
+                detection
+            )
 
             self.get_logger().info(
-                f'[{self.drone_id}] PERSON detected '
-                f'ID={det_id} '
-                f'confidence={confidence:.2f} '
-                f'pixel=({center_x:.1f}, {center_y:.1f})'
+                f'Person detected: '
+                f'id={detection_id}, '
+                f'confidence={confidence:.2f}'
             )
-
-            self.detection_counter += 1
 
 
 def main(args=None):
@@ -226,11 +306,15 @@ def main(args=None):
 
     node = DetectionNode()
 
-    rclpy.spin(node)
+    try:
+        rclpy.spin(node)
 
-    node.destroy_node()
+    except KeyboardInterrupt:
+        pass
 
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

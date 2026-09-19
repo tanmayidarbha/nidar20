@@ -4,8 +4,13 @@
     <version>3</version>
 
     <messages>
+
+        <!-- ========================================== -->
+        <!-- RUDRA -> BARBARIK: SURVIVOR TARGET -->
+        <!-- ========================================== -->
+
         <message id="180" name="TARGET_DETECTION_DATA">
-            <description>Survivor target detected by Barbarik.</description>
+            <description>Survivor target detected by Rudra.</description>
 
             <field type="uint8_t" name="target_id">
                 Survivor target ID
@@ -23,5 +28,31 @@
                 Longitude degrees * 1E7
             </field>
         </message>
+
+
+        <!-- ========================================== -->
+        <!-- BARBARIK/RUDRA: SWARM STATUS -->
+        <!-- ========================================== -->
+
+        <message id="181" name="SWARM_STATUS_ACK">
+            <description>Swarm communication and mission status.</description>
+
+            <field type="uint8_t" name="target_id">
+                Target ID associated with the event
+            </field>
+
+            <field type="uint8_t" name="event_type">
+                1=TARGET_RECEIVED, 2=PAYLOAD_DROPPED, 3=SCAN_COMPLETE
+            </field>
+
+            <field type="int32_t" name="latitude">
+                Latitude degrees * 1E7
+            </field>
+
+            <field type="int32_t" name="longitude">
+                Longitude degrees * 1E7
+            </field>
+        </message>
+
     </messages>
 </mavlink>
