@@ -23,7 +23,7 @@ class RFDSenderNode(Node):
 
         self.declare_parameter(
             'serial_port',
-            '/dev/REPLACE_ME'
+            '/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0'
         )
 
         self.declare_parameter(

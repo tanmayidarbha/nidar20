@@ -76,7 +76,7 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 {
-                    'serial_port': '/dev/REPLACE_ME',
+                    'serial_port': '/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0',
                     'baudrate': 115200
                 }
             ]

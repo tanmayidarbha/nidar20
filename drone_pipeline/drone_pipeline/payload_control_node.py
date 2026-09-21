@@ -12,10 +12,10 @@ PWM_CLOSED = 1100
 
 # Payload bay -> servo channel
 SERVO_CHANNEL_MAP = {
-    0: 9,
-    1: 9,
-    2: 11,
-    3: 11,
+    0: 11,
+    1: 11,
+    2: 13,
+    3: 13,
 }
 
 
