@@ -1,4 +1,6 @@
 import math
+import cv2
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
@@ -9,14 +11,61 @@ from std_msgs.msg import Float64
 from drone_msgs.msg import RawDetection, Detection
 
 
-CAMERA_HFOV_DEG = 81.0
-CAMERA_VFOV_DEG = 65.0
+# =============================================================
+# CAMERA CALIBRATION
+# =============================================================
+
+# SIYI A8 Mini
+#
+# Calibration resolution: 1280 x 720
+#
+# Camera matrix:
+#
+# [ fx   0   cx ]
+# [  0  fy   cy ]
+# [  0   0    1 ]
+#
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+
+FX = 724.967
+FY = 725.028
+
+CX = 626.364
+CY = 352.733
+
+CAMERA_MATRIX = np.array(
+    [
+        [FX, 0.0, CX],
+        [0.0, FY, CY],
+        [0.0, 0.0, 1.0]
+    ],
+    dtype=np.float64
+)
+
+# Distortion coefficients:
+# [k1, k2, p1, p2, k3]
+DIST_COEFFS = np.array(
+    [
+        -0.12134,
+        0.12149,
+        0.00351,
+        -0.00423,
+        -0.00894
+    ],
+    dtype=np.float64
+)
 
 
 class GeotagNode(Node):
 
     def __init__(self):
+
         super().__init__('geotag_node')
+
+        # ---------------------------------------------------------
+        # Parameters
+        # ---------------------------------------------------------
 
         # Rudra is the scout.
         self.declare_parameter(
@@ -29,6 +78,10 @@ class GeotagNode(Node):
             .get_parameter_value()
             .string_value
         )
+
+        # ---------------------------------------------------------
+        # Latest telemetry
+        # ---------------------------------------------------------
 
         self.current_lat = None
         self.current_lon = None
@@ -85,6 +138,14 @@ class GeotagNode(Node):
             f'Geotag node started for "{self.drone_id}"'
         )
 
+        self.get_logger().info(
+            'Using calibrated camera geometry for 1280x720.'
+        )
+
+        self.get_logger().info(
+            'Camera assumed to be fixed straight downward.'
+        )
+
     # =============================================================
     # TELEMETRY
     # =============================================================
@@ -108,6 +169,10 @@ class GeotagNode(Node):
 
     def detection_callback(self, msg):
 
+        # ---------------------------------------------------------
+        # Make sure telemetry is available
+        # ---------------------------------------------------------
+
         if None in (
             self.current_lat,
             self.current_lon,
@@ -122,6 +187,29 @@ class GeotagNode(Node):
 
             return
 
+        # ---------------------------------------------------------
+        # Check image resolution
+        # ---------------------------------------------------------
+
+        if (
+            msg.image_width != CAMERA_WIDTH
+            or msg.image_height != CAMERA_HEIGHT
+        ):
+
+            self.get_logger().warn(
+                f'Image resolution is '
+                f'{msg.image_width}x{msg.image_height}, '
+                f'but camera calibration is for '
+                f'{CAMERA_WIDTH}x{CAMERA_HEIGHT}. '
+                f'Skipping geotag.'
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Calculate survivor GPS position
+        # ---------------------------------------------------------
+
         target_lat, target_lon = (
             self.compute_geotag(
                 msg.pixel_x,
@@ -135,16 +223,31 @@ class GeotagNode(Node):
             )
         )
 
+        # ---------------------------------------------------------
+        # Create geotagged detection
+        # ---------------------------------------------------------
+
         out = Detection()
 
+        # Preserve original detection information.
         out.header = msg.header
         out.drone_id = self.drone_id
+
+        # Calculated survivor location.
         out.latitude = target_lat
         out.longitude = target_lon
+
+        # Drone altitude at time of detection.
         out.altitude = self.current_alt
+
+        # Preserve detection information.
         out.confidence = msg.confidence
         out.class_name = msg.class_name
         out.detection_id = msg.detection_id
+
+        # ---------------------------------------------------------
+        # Publish
+        # ---------------------------------------------------------
 
         self.publisher_.publish(
             out
@@ -172,38 +275,65 @@ class GeotagNode(Node):
         heading_deg
     ):
 
-        # Horizontal angular offset.
-        angle_x = (
-            (pixel_x - img_w / 2.0)
-            / img_w
-        ) * CAMERA_HFOV_DEG
+        # ---------------------------------------------------------
+        # Convert detected pixel into an undistorted camera ray.
+        # ---------------------------------------------------------
 
-        # Vertical angular offset.
-        angle_y = (
-            (pixel_y - img_h / 2.0)
-            / img_h
-        ) * CAMERA_VFOV_DEG
+        point = np.array(
+            [
+                [
+                    [float(pixel_x), float(pixel_y)]
+                ]
+            ],
+            dtype=np.float64
+        )
 
-        # Camera orientation convention:
-        # image centre = optical centre
-        # right = camera right
-        # forward = camera forward
+        undistorted = cv2.undistortPoints(
+            point,
+            CAMERA_MATRIX,
+            DIST_COEFFS
+        )
+
+        # Normalized camera coordinates.
+        #
+        # x = camera right
+        # y = image downward
+        # z = camera optical axis
+        #
+        normalized_x = undistorted[0, 0, 0]
+        normalized_y = undistorted[0, 0, 1]
+
+        # ---------------------------------------------------------
+        # Convert camera ray to ground offsets.
+        #
+        # Camera is assumed to point straight downward.
+        #
+        # Positive X:
+        #     camera right
+        #
+        # Positive Y in image:
+        #     downward in the image
+        #
+        # With a downward-facing camera whose top of image
+        # corresponds to drone forward:
+        #
+        #     camera X -> drone right
+        #     -camera Y -> drone forward
+        # ---------------------------------------------------------
+
         offset_right_m = (
-            altitude
-            * math.tan(
-                math.radians(angle_x)
-            )
+            altitude * normalized_x
         )
 
         offset_forward_m = (
-            altitude
-            * math.tan(
-                math.radians(-angle_y)
-            )
+            -altitude * normalized_y
         )
 
-        # Rotate camera-frame offsets into
-        # North/East using drone heading.
+        # ---------------------------------------------------------
+        # Rotate drone forward/right offsets into North/East
+        # using drone heading.
+        # ---------------------------------------------------------
+
         heading_rad = math.radians(
             heading_deg
         )
@@ -224,6 +354,10 @@ class GeotagNode(Node):
             * math.cos(heading_rad)
         )
 
+        # ---------------------------------------------------------
+        # Convert metre offsets into latitude/longitude.
+        # ---------------------------------------------------------
+
         meters_per_degree_lat = 111320.0
 
         meters_per_degree_lon = (
@@ -235,13 +369,15 @@ class GeotagNode(Node):
 
         target_lat = (
             drone_lat
-            + north_offset
+            +
+            north_offset
             / meters_per_degree_lat
         )
 
         target_lon = (
             drone_lon
-            + east_offset
+            +
+            east_offset
             / meters_per_degree_lon
         )
 
@@ -255,12 +391,14 @@ def main(args=None):
     node = GeotagNode()
 
     try:
+
         rclpy.spin(node)
 
     except KeyboardInterrupt:
         pass
 
     finally:
+
         node.destroy_node()
         rclpy.shutdown()
 

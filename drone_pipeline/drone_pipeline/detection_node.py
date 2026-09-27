@@ -1,34 +1,45 @@
 import os
-
 import cv2
 import rclpy
+
 from rclpy.node import Node
-
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool
-
 from cv_bridge import CvBridge
-from ultralytics import YOLO
+
+from rfdetr import RFDETRMedium
 
 from drone_msgs.msg import RawDetection
 
 
-MODEL_PATH = '/home/tanmayi_unix/nidar20_ws/models/best.pt'
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MODEL_PATH = '/home/tanmayi_unix/nidar20_ws/models/best.pth'
+
 CONFIDENCE_THRESHOLD = 0.5
 
-DETECTION_SAVE_DIR = '/home/tanmayi_unix/nidar20_ws/detections'
+SAVE_DIR = '/home/tanmayi_unix/nidar20_ws/detections'
 
+# RF-DETR model is trained for survivor/person detection.
+# We assume person is class 0 in the trained model.
+PERSON_CLASS_ID = 0
+
+
+# ============================================================
+# NODE
+# ============================================================
 
 class DetectionNode(Node):
 
     def __init__(self):
         super().__init__('detection_node')
 
-        # Rudra is the scout.
-        self.declare_parameter(
-            'drone_id',
-            'rudra'
-        )
+        # ----------------------------------------------------
+        # Parameters
+        # ----------------------------------------------------
+
+        self.declare_parameter('drone_id', 'rudra')
 
         self.drone_id = (
             self.get_parameter('drone_id')
@@ -36,106 +47,106 @@ class DetectionNode(Node):
             .string_value
         )
 
+        # ----------------------------------------------------
+        # Paths
+        # ----------------------------------------------------
+
+        self.save_dir = os.path.join(
+            SAVE_DIR,
+            self.drone_id
+        )
+
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        # ----------------------------------------------------
+        # RF-DETR
+        # ----------------------------------------------------
+
+        self.get_logger().info(
+            f'Loading RF-DETR Medium model from: {MODEL_PATH}'
+        )
+
+        if not os.path.exists(MODEL_PATH):
+            self.get_logger().error(
+                f'RF-DETR model not found: {MODEL_PATH}'
+            )
+            raise FileNotFoundError(MODEL_PATH)
+
+        self.model = RFDETRMedium(
+            pretrain_weights=MODEL_PATH
+        )
+
+        self.get_logger().info(
+            'RF-DETR Medium model loaded successfully.'
+        )
+
+        # ----------------------------------------------------
+        # ROS
+        # ----------------------------------------------------
+
         self.bridge = CvBridge()
 
         self.scan_started = False
         self.detection_counter = 0
 
-        # ---------------------------------------------------------
-        # Paths
-        # ---------------------------------------------------------
+        image_topic = f'/{self.drone_id}/image_raw'
+        scan_start_topic = f'/{self.drone_id}/scan_start'
+        detection_topic = f'/{self.drone_id}/raw_detections'
 
-        self.save_dir = os.path.join(
-            DETECTION_SAVE_DIR,
-            self.drone_id
-        )
-
-        os.makedirs(
-            self.save_dir,
-            exist_ok=True
-        )
-
-        # ---------------------------------------------------------
-        # Topics
-        # ---------------------------------------------------------
-
-        image_topic = (
-            f'/{self.drone_id}/image_raw'
-        )
-
-        scan_start_topic = (
-            f'/{self.drone_id}/scan_start'
-        )
-
-        detection_topic = (
-            f'/{self.drone_id}/raw_detections'
-        )
-
-        self.image_sub = self.create_subscription(
+        self.image_subscription = self.create_subscription(
             Image,
             image_topic,
             self.image_callback,
             10
         )
 
-        self.scan_start_sub = self.create_subscription(
-            Bool,
+        self.scan_subscription = self.create_subscription(
+            __import__('std_msgs.msg', fromlist=['Bool']).Bool,
             scan_start_topic,
             self.scan_start_callback,
             10
         )
 
-        self.detection_pub = self.create_publisher(
+        self.detection_publisher = self.create_publisher(
             RawDetection,
             detection_topic,
             10
-        )
-
-        # ---------------------------------------------------------
-        # YOLO
-        # ---------------------------------------------------------
-
-        self.get_logger().info(
-            f'Loading YOLO model from {MODEL_PATH}'
-        )
-
-        self.model = YOLO(
-            MODEL_PATH
         )
 
         self.get_logger().info(
             f'Detection node started for "{self.drone_id}"'
         )
 
-    # =============================================================
+        self.get_logger().info(
+            f'Waiting for scan start on {scan_start_topic}'
+        )
+
+    # ========================================================
     # SCAN START
-    # =============================================================
+    # ========================================================
 
     def scan_start_callback(self, msg):
 
-        if msg.data:
+        if msg.data and not self.scan_started:
 
-            if not self.scan_started:
+            self.scan_started = True
 
-                self.scan_started = True
+            self.get_logger().info(
+                f'[{self.drone_id}] Scan started. '
+                f'RF-DETR detection is now active.'
+            )
 
-                self.get_logger().info(
-                    'Scan started. Detection is now active.'
-                )
-
-    # =============================================================
-    # IMAGE
-    # =============================================================
+    # ========================================================
+    # IMAGE CALLBACK
+    # ========================================================
 
     def image_callback(self, msg):
 
-        # Do not run YOLO before Rudra reaches the
-        # scan-start waypoint.
+        # Do not run detection before mission scan starts.
         if not self.scan_started:
             return
 
         try:
-
             frame = self.bridge.imgmsg_to_cv2(
                 msg,
                 desired_encoding='bgr8'
@@ -149,156 +160,166 @@ class DetectionNode(Node):
 
             return
 
-        # ---------------------------------------------------------
-        # YOLO inference
-        # ---------------------------------------------------------
+        image_height, image_width = frame.shape[:2]
+
+        # ----------------------------------------------------
+        # RF-DETR expects RGB images.
+        # OpenCV gives us BGR.
+        # ----------------------------------------------------
+
+        rgb_frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB
+        )
 
         try:
 
-            results = self.model(
-                frame,
-                conf=CONFIDENCE_THRESHOLD,
-                verbose=False
+            detections = self.model.predict(
+                rgb_frame,
+                threshold=CONFIDENCE_THRESHOLD
             )
 
         except Exception as e:
 
             self.get_logger().error(
-                f'YOLO inference failed: {e}'
+                f'RF-DETR inference failed: {e}'
             )
 
             return
 
-        if not results:
-            return
+        # ----------------------------------------------------
+        # Process detections
+        # ----------------------------------------------------
 
-        result = results[0]
+        boxes = detections.xyxy
+        confidences = detections.confidence
+        class_ids = detections.class_id
 
-        if result.boxes is None:
-            return
+        detection_count = 0
 
-        image_height, image_width = frame.shape[:2]
+        for box, confidence, class_id in zip(
+            boxes,
+            confidences,
+            class_ids
+        ):
 
-        for box in result.boxes:
+            confidence = float(confidence)
+            class_id = int(class_id)
 
-            confidence = float(
-                box.conf[0]
-            )
-
-            class_id = int(
-                box.cls[0]
-            )
-
-            class_name = self.model.names[
-                class_id
-            ]
-
-            # We only care about people.
-            if class_name.lower() != 'person':
+            # We only want persons/survivors.
+            if class_id != PERSON_CLASS_ID:
                 continue
 
-            x1, y1, x2, y2 = (
-                box.xyxy[0].tolist()
-            )
+            if confidence < CONFIDENCE_THRESHOLD:
+                continue
 
-            pixel_x = (
-                x1 + x2
-            ) / 2.0
+            # ------------------------------------------------
+            # Bounding box
+            # ------------------------------------------------
 
-            pixel_y = (
-                y1 + y2
-            ) / 2.0
+            x1, y1, x2, y2 = box
+
+            x1 = int(x1)
+            y1 = int(y1)
+            x2 = int(x2)
+            y2 = int(y2)
+
+            # ------------------------------------------------
+            # Bounding-box center
+            # ------------------------------------------------
+
+            pixel_x = (x1 + x2) / 2.0
+            pixel_y = (y1 + y2) / 2.0
+
+            # ------------------------------------------------
+            # Detection ID
+            # ------------------------------------------------
 
             self.detection_counter += 1
 
-            detection_id = (
-                self.detection_counter
+            detection_id = self.detection_counter
+
+            # ------------------------------------------------
+            # Create ROS RawDetection message
+            # ------------------------------------------------
+
+            detection_msg = RawDetection()
+
+            detection_msg.header = msg.header
+
+            detection_msg.detection_id = detection_id
+
+            detection_msg.pixel_x = pixel_x
+            detection_msg.pixel_y = pixel_y
+
+            detection_msg.confidence = confidence
+
+            detection_msg.class_name = 'person'
+
+            detection_msg.image_width = image_width
+            detection_msg.image_height = image_height
+
+            self.detection_publisher.publish(
+                detection_msg
             )
 
-            # -----------------------------------------------------
-            # Save detection image
-            # -----------------------------------------------------
+            detection_count += 1
 
-            annotated = frame.copy()
+            # ------------------------------------------------
+            # Draw detection
+            # ------------------------------------------------
 
             cv2.rectangle(
-                annotated,
-                (int(x1), int(y1)),
-                (int(x2), int(y2)),
+                frame,
+                (x1, y1),
+                (x2, y2),
                 (0, 255, 0),
                 2
             )
 
+            label = (
+                f'person {confidence:.2f} '
+                f'ID:{detection_id}'
+            )
+
             cv2.putText(
-                annotated,
-                f'person {confidence:.2f}',
-                (int(x1), max(20, int(y1) - 10)),
+                frame,
+                label,
+                (x1, max(y1 - 10, 0)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (0, 255, 0),
                 2
             )
 
-            image_filename = (
-                f'detection_{detection_id}.jpg'
+            self.get_logger().info(
+                f'[{self.drone_id}] '
+                f'Person detected: '
+                f'ID={detection_id}, '
+                f'confidence={confidence:.2f}, '
+                f'center=({pixel_x:.1f}, {pixel_y:.1f})'
             )
 
-            image_path = os.path.join(
+        # ----------------------------------------------------
+        # Save frame only when a person was detected
+        # ----------------------------------------------------
+
+        if detection_count > 0:
+
+            filename = os.path.join(
                 self.save_dir,
-                image_filename
+                f'detection_{self.detection_counter}.jpg'
             )
 
             cv2.imwrite(
-                image_path,
-                annotated
+                filename,
+                frame
             )
 
-            # -----------------------------------------------------
-            # Publish RawDetection
-            # -----------------------------------------------------
 
-            detection = RawDetection()
-
-            detection.header = msg.header
-
-            detection.detection_id = (
-                detection_id
-            )
-
-            detection.pixel_x = (
-                float(pixel_x)
-            )
-
-            detection.pixel_y = (
-                float(pixel_y)
-            )
-
-            detection.confidence = (
-                confidence
-            )
-
-            detection.class_name = (
-                class_name
-            )
-
-            detection.image_width = (
-                image_width
-            )
-
-            detection.image_height = (
-                image_height
-            )
-
-            self.detection_pub.publish(
-                detection
-            )
-
-            self.get_logger().info(
-                f'Person detected: '
-                f'id={detection_id}, '
-                f'confidence={confidence:.2f}'
-            )
-
+# ============================================================
+# MAIN
+# ============================================================
 
 def main(args=None):
 
@@ -307,12 +328,15 @@ def main(args=None):
     node = DetectionNode()
 
     try:
+
         rclpy.spin(node)
 
     except KeyboardInterrupt:
+
         pass
 
     finally:
+
         node.destroy_node()
         rclpy.shutdown()
 

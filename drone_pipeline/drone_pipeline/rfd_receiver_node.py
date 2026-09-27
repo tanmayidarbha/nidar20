@@ -24,7 +24,7 @@ class RFDReceiverNode(Node):
 
         self.declare_parameter(
             'serial_port',
-            '/dev/REPLACE_ME'
+            '/dev/serial0'
         )
 
         self.declare_parameter(
